@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Resumable upload demo (tus + Uppy)</title>
+  <!-- Uppy is loaded from Transloadit's CDN (pinned version). No build step needed. -->
+  <link rel="stylesheet" href="https://releases.transloadit.com/uppy/v5.2.1/uppy.min.css">
+  <style>
+    :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#5d6978; --line:#dde2e8; --accent:#1a6cf0; --ok:#157f3b; --warn:#b45309; --bad:#b42318; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#11151a; --card:#1a2028; --text:#e8ecf1; --muted:#9aa6b4; --line:#2b3440; --accent:#6aa1ff; --ok:#5fd28a; --warn:#f0a95a; --bad:#ff8a80; }
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    main { max-width: 860px; margin: 0 auto; padding: 28px 20px 60px; }
+    h1 { font-size: 28px; margin: 0 0 4px; }
+    .lead { color: var(--muted); margin: 0 0 24px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 18px; }
+    .card h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); flex: 1 1 200px; }
+    label.narrow { flex: 0 0 130px; }
+    input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+    button { font: inherit; border: 0; border-radius: 8px; padding: 9px 16px; cursor: pointer; background: var(--accent); color: #fff; font-weight: 600; }
+    button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    button:disabled { opacity: .5; cursor: default; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+    .stat b { display: block; font-size: 24px; line-height: 1.2; }
+    .stat span { color: var(--muted); font-size: 13px; }
+    .banner { margin-top: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); display: none; }
+    .banner.show { display: block; }
+    .banner.ok { color: var(--ok); } .banner.warn { color: var(--warn); } .banner.bad { color: var(--bad); }
+    .controls { display: flex; gap: 10px; margin-top: 12px; }
+    ol#log { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow: auto; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    ol#log li { padding: 2px 0; border-bottom: 1px dashed var(--line); }
+    .m { display:inline-block; min-width: 56px; font-weight: 700; }
+    .m.POST { color: var(--accent); } .m.PATCH { color: var(--ok); } .m.HEAD { color: var(--warn); } .m.DELETE, .m.ERROR { color: var(--bad); }
+    small.hint { color: var(--muted); display:block; margin-top: 8px; }
+    .uppy-Dashboard-inner { max-width: 100%; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Resumable file upload</h1>
+  <p class="lead">Pick a large file and start the upload. Pause it, cut the connection, or even close the tab: the upload continues from where it stopped instead of starting over.</p>
+
+  <section class="card" id="settings">
+    <h2>Connection</h2>
+    <div class="row">
+      <label>Upload endpoint
+        <input id="endpoint" value="/files/uploads" spellcheck="false">
+      </label>
+      <label class="narrow">Chunk size (MB)
+        <input id="chunk" type="number" min="1" step="1" value="2">
+      </label>
+      <label>Authorization header (optional)
+        <input id="auth" placeholder="Bearer &lt;token&gt;" spellcheck="false" autocomplete="off">
+      </label>
+      <button id="apply" class="secondary" type="button">Apply</button>
+    </div>
+    <small class="hint">The token is kept in memory only and is never saved. Smaller chunks make the offsets move in visible steps during a demo.</small>
+  </section>
+
+  <section class="card">
+    <h2>Upload</h2>
+    <div id="dashboard"></div>
+    <div class="controls">
+      <button id="pause" class="secondary" type="button">Pause</button>
+      <button id="resume" class="secondary" type="button">Resume</button>
+    </div>
+    <div id="banner" class="banner" role="status"></div>
+  </section>
+
+  <section class="card">
+    <h2>What the server knows</h2>
+    <div class="stats">
+      <div class="stat"><b id="s-bytes">0 B of 0 B</b><span>Received so far</span></div>
+      <div class="stat"><b id="s-resumes">0</b><span>Times resumed</span></div>
+      <div class="stat"><b id="s-offset">-</b><span>Last offset reported by the server</span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Request log</h2>
+    <ol id="log"></ol>
+    <small class="hint">POST creates the upload, PATCH sends a chunk, HEAD asks "how much do you have?" when the client resumes.</small>
+  </section>
+</main>
+
+<script type="module">
+  import { Uppy, Dashboard, Tus } from "https://releases.transloadit.com/uppy/v5.2.1/uppy.min.mjs";
+
+  const $ = (id) => document.getElementById(id);
+  const MB = 1024 * 1024;
+  let resumes = 0;
+
+  const fmt = (n) => {
+    if (n == null || Number.isNaN(Number(n))) return "-";
+    n = Number(n);
+    if (n < 1024) return n + " B";
+    if (n < MB) return (n / 1024).toFixed(1) + " KB";
+    if (n < 1024 * MB) return (n / MB).toFixed(1) + " MB";
+    return (n / (1024 * MB)).toFixed(2) + " GB";
+  };
+
+  const banner = (kind, text) => {
+    const b = $("banner");
+    b.className = "banner show " + kind;
+    b.textContent = text;
+  };
+
+  const logLine = (method, text) => {
+    const li = document.createElement("li");
+    const t = new Date().toLocaleTimeString();
+    const m = document.createElement("span");
+    m.className = "m " + method;
+    m.textContent = method;
+    li.append(t + "  ", m, " " + text);
+    const ol = $("log");
+    ol.append(li);
+    ol.scrollTop = ol.scrollHeight;
+  };
+
+  const chunkBytes = () => Math.max(1, Number($("chunk").value) || 2) * MB;
+
+  const uppy = new Uppy({ autoProceed: false, restrictions: { maxNumberOfFiles: 1 } })
+    .use(Dashboard, {
+      inline: true,
+      target: "#dashboard",
+      height: 320,
+      width: "100%",
+      showProgressDetails: true,
+      proudlyDisplayPoweredByUppy: false,
+      note: "One file at a time. Large files are sent in chunks.",
+    })
+    .use(Tus, {
+      endpoint: $("endpoint").value.trim(),
+      chunkSize: chunkBytes(),
+      // keep retrying for a while so a short network drop heals by itself
+      retryDelays: [0, 1000, 3000, 5000, 10000, 10000, 10000],
+      limit: 1,
+      // remember the upload URL in localStorage so a page reload can resume too
+      storeFingerprintForResuming: true,
+      removeFingerprintOnSuccess: true,
+      async onBeforeRequest(req) {
+        const token = $("auth").value.trim();
+        if (token) req.setHeader("Authorization", token);
+      },
+      async onAfterResponse(req, res) {
+        const method = req.getMethod();
+        const status = res.getStatus();
+        const offset = res.getHeader("Upload-Offset");
+        const url = req.getURL().replace(/^https?:\/\/[^/]+/, "");
+        let extra = "";
+        if (method === "PATCH" && offset != null) extra = " -> server has " + fmt(offset);
+        if (method === "PATCH") $("s-offset").textContent = fmt(offset);
+        if (method === "HEAD" && status === 200) {
+          if (offset != null) {
+            resumes += 1;
+            $("s-resumes").textContent = String(resumes);
+            $("s-offset").textContent = fmt(offset);
+            extra = " -> server remembers " + fmt(offset);
+            banner("warn", "Connection restored. Continuing from " + fmt(offset) + " instead of starting over.");
+          } else {
+            extra = " -> Upload-Offset not readable (CORS: expose it, or use serve.py)";
+          }
+        }
+        logLine(method, status + "  " + url + extra);
+      },
+    });
+
+  uppy.on("upload-progress", (file, p) => {
+    $("s-bytes").textContent = fmt(p.bytesUploaded) + " of " + fmt(p.bytesTotal);
+  });
+  uppy.on("upload-success", (file, resp) => {
+    banner("ok", "Upload complete" + (resp && resp.uploadURL ? ": " + resp.uploadURL : "."));
+  });
+  uppy.on("upload-error", (file, err) => {
+    const msg = String((err && err.message) || err);
+    logLine("ERROR", msg.split("\n")[0]);
+    const unreachable = /failed to create upload|network|status 0|Failed to fetch/i.test(msg);
+    banner("bad", unreachable
+      ? "The browser could not talk to the service. Check the endpoint, and see the CORS note in the README (or run serve.py)."
+      : "Upload stopped: " + msg.split("\n")[0] + ". Press Retry in the upload panel to continue.");
+  });
+
+  const tus = () => uppy.getPlugin("Tus");
+  $("apply").addEventListener("click", () => {
+    tus().setOptions({ endpoint: $("endpoint").value.trim(), chunkSize: chunkBytes() });
+    banner("ok", "Settings applied: " + $("endpoint").value.trim() + ", " + (chunkBytes() / MB) + " MB chunks.");
+  });
+  $("pause").addEventListener("click", () => { uppy.pauseAll(); banner("warn", "Paused. The server keeps what it already received."); });
+  $("resume").addEventListener("click", () => { uppy.resumeAll(); banner("ok", "Resuming..."); });
+</script>
+</body>
+</html>
