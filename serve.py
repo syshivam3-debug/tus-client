@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Local server for the tus demo page. Python 3.8+, standard library only.
+"""Local server for the tus upload page. Python 3.8+, standard library only.
 
 It serves index.html and, on the same origin, either
 
   --target URL   forwards every other request to a real tus service
                  (so the browser never makes a cross-origin call and CORS
                  does not matter), or
-  --mock         answers tus requests itself, so you can rehearse the demo
+  --mock         answers tus requests itself, so you can rehearse the upload
                  before the real environment is ready.
 
 Examples:
@@ -154,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in DROP_REQ and not k.lower().startswith("sec-")
                    and k.lower() not in ("accept-language", "user-agent", "cookie", "accept-encoding")}
-        headers["User-Agent"] = "tus-demo-proxy"
+        headers["User-Agent"] = "tus-upload-proxy"
         for h in args.header:
             name, _, value = h.partition(":")
             headers[name.strip()] = value.strip()
@@ -234,7 +234,7 @@ def main():
     else:
         tmpdir = tempfile.mkdtemp(prefix="tus-mock-")
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print("Demo page: http://localhost:%d/  (%s)" % (args.port, "mock tus server" if args.mock else "proxy to " + args.target))
+    print("Upload page: http://localhost:%d/  (%s)" % (args.port, "mock tus server" if args.mock else "proxy to " + args.target))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
