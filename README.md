@@ -20,10 +20,11 @@ Options: `--port`, `--cafile` (CA bundle for an internal https certificate), `--
 
 ## Demo script
 
-1. Pick a file of a few hundred MB and press Upload. Set the chunk size so the offsets move in steps (any value from 0.05 MB up; for a 1 MB file try 0.1).
+1. Pick any file and press Upload. **Slow demo mode** (on by default) splits the file into about 8 chunks and waits 1 second before each one, so even a 160 KB file takes several seconds and there is time to pause. Turn it off to upload at full speed with the chunk size from the form.
 2. Press **Pause** (or switch the browser's Network tab to Offline). The server keeps what it received.
 3. Press **Resume** (or go back online). The log shows a `HEAD` request, then `PATCH` continuing from the reported offset.
-4. Optional: reload the page mid-upload and add the same file again. The client finds the unfinished upload and continues it.
+4. Watch **Upload details**: it shows the file, the upload ID and URL once the session exists, progress and status while uploading, and the file location (`Content-Location`) plus the file record once the service finishes.
+5. Optional: reload the page mid-upload and add the same file again. The client finds the unfinished upload and continues it.
 
 ## Using the page without serve.py
 

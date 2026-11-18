@@ -20,14 +20,20 @@
     .card h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
     .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
     label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); flex: 1 1 200px; }
-    label.narrow { flex: 0 0 130px; }
+    label.narrow { flex: 0 0 150px; }
+    label.check { flex: 1 1 100%; flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 14px; }
     input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+    input[type=checkbox] { width: 18px; height: 18px; padding: 0; }
     button { font: inherit; border: 0; border-radius: 8px; padding: 9px 16px; cursor: pointer; background: var(--accent); color: #fff; font-weight: 600; }
     button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
     button:disabled { opacity: .5; cursor: default; }
     .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
     .stat b { display: block; font-size: 24px; line-height: 1.2; }
     .stat span { color: var(--muted); font-size: 13px; }
+    .kv { display: grid; grid-template-columns: 190px 1fr; gap: 6px 14px; font-size: 14px; }
+    .kv .k { color: var(--muted); }
+    .kv .v { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .kv .empty { grid-column: 1 / -1; color: var(--muted); }
     .banner { margin-top: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); display: none; }
     .banner.show { display: block; }
     .banner.ok { color: var(--ok); } .banner.warn { color: var(--warn); } .banner.bad { color: var(--bad); }
@@ -51,15 +57,19 @@
       <label>Upload endpoint
         <input id="endpoint" value="/files/uploads" spellcheck="false">
       </label>
-      <label class="narrow">Chunk size (MB)
-        <input id="chunk" type="number" min="0.05" step="any" value="2">
-      </label>
       <label>Authorization header (optional)
         <input id="auth" placeholder="Bearer &lt;token&gt;" spellcheck="false" autocomplete="off">
       </label>
+      <label class="narrow">Chunk size (MB)
+        <input id="chunk" type="number" min="0.02" step="any" value="2">
+      </label>
       <button id="apply" class="secondary" type="button">Apply</button>
+      <label class="check">
+        <input id="demo" type="checkbox" checked>
+        Slow demo mode: split any file into about 8 chunks and wait 1 second between them, so there is time to pause
+      </label>
     </div>
-    <small class="hint">The token is kept in memory only and is never saved. Smaller chunks make the offsets move in visible steps during a demo.</small>
+    <small class="hint">The token is kept in memory only and is never saved. With demo mode off, the chunk size above is used and nothing is slowed down.</small>
   </section>
 
   <section class="card">
@@ -78,12 +88,16 @@
       <div class="stat"><b id="s-bytes">0 B of 0 B</b><span>Received so far</span></div>
       <div class="stat"><b id="s-resumes">0</b><span>Times resumed</span></div>
       <div class="stat"><b id="s-offset">-</b><span>Last offset reported by the server</span></div>
-      <div class="stat"><b id="s-loc" style="font-size:15px;word-break:break-all">-</b><span>File location once complete</span></div>
     </div>
+  </section>
+
+  <section class="card">
+    <h2>Upload details</h2>
+    <div id="details" class="kv"></div>
     <div class="controls">
-      <button id="details" class="secondary" type="button" disabled>Show file details</button>
+      <button id="refresh" class="secondary" type="button" disabled>Refresh file record</button>
     </div>
-    <pre id="details-out" style="margin:12px 0 0;white-space:pre-wrap;font-size:13px"></pre>
+    <small class="hint">Fills in as information becomes available: file, upload session, progress, then the finished file.</small>
   </section>
 
   <section class="card">
@@ -98,7 +112,15 @@
 
   const $ = (id) => document.getElementById(id);
   const MB = 1024 * 1024;
+  const MIN_CHUNK = 16 * 1024;     // smallest chunk we will use
+  const TARGET_CHUNKS = 8;         // demo mode aims for about this many chunks per file
+  const PACE_MS = 1000;            // demo mode waits this long before each chunk
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   let resumes = 0;
+  let chunksSent = 0;
+  let fileSize = 0;
+  let fileLocation = null;         // Content-Location from the final PATCH response
 
   const fmt = (n) => {
     if (n == null || Number.isNaN(Number(n))) return "-";
@@ -117,18 +139,38 @@
 
   const logLine = (method, text) => {
     const li = document.createElement("li");
-    const t = new Date().toLocaleTimeString();
     const m = document.createElement("span");
     m.className = "m " + method;
     m.textContent = method;
-    li.append(t + "  ", m, " " + text);
+    li.append(new Date().toLocaleTimeString() + "  ", m, " " + text);
     const ol = $("log");
     ol.append(li);
     ol.scrollTop = ol.scrollHeight;
   };
 
-  // any size from 50 KB up, so even a small test file is sent in several chunks
-  const chunkBytes = () => Math.max(50 * 1024, Math.round((Number($("chunk").value) || 2) * MB));
+  // ---- live details: rows are added as soon as the information exists ----
+  const details = new Map();
+  const renderDetails = () => {
+    const box = $("details");
+    box.replaceChildren();
+    if (!details.size) {
+      const d = document.createElement("div");
+      d.className = "empty";
+      d.textContent = "Nothing yet. Add a file to begin.";
+      box.append(d);
+      return;
+    }
+    for (const [k, v] of details) {
+      const a = document.createElement("span"); a.className = "k"; a.textContent = k;
+      const b = document.createElement("span"); b.className = "v"; b.textContent = v;
+      box.append(a, b);
+    }
+  };
+  const setDetail = (key, value) => { details.set(key, String(value)); renderDetails(); };
+  renderDetails();
+
+  const pathOf = (u) => { const x = new URL(u, location.href); return x.pathname + x.search; };
+  const lastSegment = (p) => p.split("?")[0].split("/").filter(Boolean).pop() || "";
 
   // the Authorization header value from the form; a bare token gets "Bearer " added
   const authHeader = () => {
@@ -136,7 +178,8 @@
     if (token && !/^\w+\s/.test(token)) token = "Bearer " + token;
     return token;
   };
-  let fileLocation = null;   // Content-Location from the final PATCH response
+
+  const manualChunk = () => Math.max(MIN_CHUNK, Math.round((Number($("chunk").value) || 2) * MB));
 
   const uppy = new Uppy({ autoProceed: false, restrictions: { maxNumberOfFiles: 1 } })
     .use(Dashboard, {
@@ -150,7 +193,7 @@
     })
     .use(Tus, {
       endpoint: $("endpoint").value.trim(),
-      chunkSize: chunkBytes(),
+      chunkSize: manualChunk(),
       // keep retrying for a while so a short network drop heals by itself
       retryDelays: [0, 1000, 3000, 5000, 10000, 10000, 10000],
       limit: 1,
@@ -160,6 +203,8 @@
       async onBeforeRequest(req) {
         const token = authHeader();
         if (token) req.setHeader("Authorization", token);
+        // demo mode: pause before every chunk so there is time to click Pause
+        if (req.getMethod() === "PATCH" && $("demo").checked) await sleep(PACE_MS);
       },
       async onAfterResponse(req, res) {
         const method = req.getMethod();
@@ -167,14 +212,31 @@
         const offset = res.getHeader("Upload-Offset");
         const url = req.getURL().replace(/^https?:\/\/[^/]+/, "");
         let extra = "";
-        if (method === "PATCH" && offset != null) extra = " -> server has " + fmt(offset);
-        if (method === "PATCH") $("s-offset").textContent = fmt(offset);
+
+        if (method === "POST" && status === 201) {
+          const loc = res.getHeader("Location");
+          if (loc) {
+            setDetail("Upload ID", lastSegment(pathOf(loc)));
+            setDetail("Upload URL", pathOf(loc));
+          }
+          setDetail("Status", "Upload session created on the server");
+        }
+        if (method === "PATCH" && status === 204 && offset != null) {
+          chunksSent += 1;
+          $("s-offset").textContent = fmt(offset);
+          extra = " -> server has " + fmt(offset);
+          setDetail("Chunks sent", chunksSent);
+          setDetail("Received by server", fmt(offset) + (fileSize ? " of " + fmt(fileSize) : ""));
+          if (!fileLocation) setDetail("Status", "Uploading");
+        }
         if (method === "HEAD" && status === 200) {
           if (offset != null) {
             resumes += 1;
             $("s-resumes").textContent = String(resumes);
             $("s-offset").textContent = fmt(offset);
             extra = " -> server remembers " + fmt(offset);
+            setDetail("Times resumed", resumes);
+            setDetail("Status", "Resumed: server remembers " + fmt(offset));
             banner("warn", "Connection restored. Continuing from " + fmt(offset) + " instead of starting over.");
           } else {
             extra = " -> Upload-Offset not readable (CORS: expose it, or use serve.py)";
@@ -182,20 +244,80 @@
         }
         // when the last chunk lands, the service reports where the finished file lives
         const contentLocation = res.getHeader("Content-Location");
-        if (contentLocation) {
+        if (contentLocation && contentLocation !== fileLocation) {
           fileLocation = contentLocation;
-          $("s-loc").textContent = contentLocation;
-          $("details").disabled = false;
+          setDetail("File location", contentLocation);
+          setDetail("File ID", lastSegment(pathOf(contentLocation)));
+          setDetail("Status", "Finalized by the server");
+          $("refresh").disabled = false;
           extra += " -> file is at " + contentLocation;
+          fetchRecord();
         }
         logLine(method, status + "  " + url + extra);
       },
     });
 
+  const tus = () => uppy.getPlugin("Tus");
+  const pausedAt = () => { const o = $("s-offset").textContent; return o === "-" ? "" : " at " + o; };
+
+  // demo mode picks a chunk size from the file size; otherwise the field decides
+  const applyChunkSize = () => {
+    const size = $("demo").checked && fileSize
+      ? Math.max(MIN_CHUNK, Math.ceil(fileSize / TARGET_CHUNKS))
+      : manualChunk();
+    tus().setOptions({ chunkSize: size });
+    return size;
+  };
+
+  // read the finished file's record from the file service
+  async function fetchRecord() {
+    if (!fileLocation) return;
+    const path = pathOf(fileLocation);   // path only, so it goes through this page's own server
+    setDetail("File record", "reading " + path + " ...");
+    try {
+      const headers = { Accept: "application/json" };
+      if (authHeader()) headers.Authorization = authHeader();
+      const r = await fetch(path, { headers });
+      if (!r.ok) { setDetail("File record", "the service answered " + r.status + " for " + path); return; }
+      const f = await r.json();
+      details.delete("File record");
+      const fields = [["name", "Name on server"], ["size", "Size on server"], ["contentType", "Content type"],
+                      ["createdBy", "Created by"], ["creationTimeStamp", "Created at"], ["fileStatus", "File status"]];
+      for (const [k, label] of fields) {
+        if (f[k] !== undefined) details.set(label, k === "size" ? fmt(f.size) + " (" + f.size + " bytes)" : f[k]);
+      }
+      renderDetails();
+    } catch (e) {
+      setDetail("File record", "could not read it: " + e.message);
+    }
+  }
+
+  uppy.on("file-added", (file) => {
+    details.clear();
+    resumes = 0; chunksSent = 0; fileLocation = null;
+    fileSize = file.size || 0;
+    $("s-resumes").textContent = "0";
+    $("s-offset").textContent = "-";
+    $("s-bytes").textContent = "0 B of " + fmt(fileSize);
+    $("refresh").disabled = true;
+    $("banner").className = "banner";
+    setDetail("Status", "Ready to upload");
+    setDetail("File name", file.name);
+    setDetail("File size", fmt(fileSize) + " (" + fileSize + " bytes)");
+    setDetail("File type", file.type || "unknown");
+    const c = applyChunkSize();
+    setDetail("Chunk size", fmt(c) + ($("demo").checked ? " (about " + Math.ceil(fileSize / c) + " chunks, 1 s apart)" : ""));
+  });
+  uppy.on("upload", () => setDetail("Status", "Connecting to the server"));
   uppy.on("upload-progress", (file, p) => {
     $("s-bytes").textContent = fmt(p.bytesUploaded) + " of " + fmt(p.bytesTotal);
+    if (p.bytesTotal) setDetail("Progress", Math.floor((p.bytesUploaded / p.bytesTotal) * 100) + "%");
+  });
+  uppy.on("upload-pause", (fileID, isPaused) => {
+    setDetail("Status", isPaused ? "Paused" + pausedAt() : "Resuming...");
   });
   uppy.on("upload-success", (file, resp) => {
+    setDetail("Status", "Complete");
     banner("ok", fileLocation
       ? "Upload complete. The file is at " + fileLocation
       : "Upload complete" + (resp && resp.uploadURL ? ": " + resp.uploadURL : "."));
@@ -203,36 +325,30 @@
   uppy.on("upload-error", (file, err) => {
     const msg = String((err && err.message) || err);
     logLine("ERROR", msg.split("\n")[0]);
+    setDetail("Status", "Stopped: " + msg.split("\n")[0]);
     const unreachable = /failed to create upload|network|status 0|Failed to fetch/i.test(msg);
     banner("bad", unreachable
       ? "The browser could not talk to the service. Check the endpoint, and see the CORS note in the README (or run serve.py)."
       : "Upload stopped: " + msg.split("\n")[0] + ". Press Retry in the upload panel to continue.");
   });
 
-  const tus = () => uppy.getPlugin("Tus");
   $("apply").addEventListener("click", () => {
-    tus().setOptions({ endpoint: $("endpoint").value.trim(), chunkSize: chunkBytes() });
-    banner("ok", "Settings applied: " + $("endpoint").value.trim() + ", " + (chunkBytes() / MB) + " MB chunks.");
+    tus().setOptions({ endpoint: $("endpoint").value.trim() });
+    const c = applyChunkSize();
+    banner("ok", "Settings applied: " + $("endpoint").value.trim() + ", chunk size " + fmt(c) + ".");
   });
-  $("details").addEventListener("click", async () => {
-    if (!fileLocation) return;
-    const out = $("details-out");
-    try {
-      // use only the path so the request goes through this page's own server (no CORS)
-      const u = new URL(fileLocation, location.href);
-      const headers = { Accept: "application/json" };
-      if (authHeader()) headers.Authorization = authHeader();
-      const r = await fetch(u.pathname + u.search, { headers });
-      if (!r.ok) { out.textContent = "The service answered " + r.status + " for " + u.pathname; return; }
-      const f = await r.json();
-      out.textContent = ["name", "id", "size", "contentType", "createdBy", "creationTimeStamp"]
-        .filter((k) => f[k] !== undefined).map((k) => k + ": " + f[k]).join("\n");
-    } catch (e) {
-      out.textContent = "Could not read the file details: " + e.message;
-    }
+  $("demo").addEventListener("change", applyChunkSize);
+  $("refresh").addEventListener("click", fetchRecord);
+  $("pause").addEventListener("click", () => {
+    uppy.pauseAll();
+    setDetail("Status", "Paused" + pausedAt());
+    banner("warn", "Paused. The server keeps what it already received.");
   });
-  $("pause").addEventListener("click", () => { uppy.pauseAll(); banner("warn", "Paused. The server keeps what it already received."); });
-  $("resume").addEventListener("click", () => { uppy.resumeAll(); banner("ok", "Resuming..."); });
+  $("resume").addEventListener("click", () => {
+    uppy.resumeAll();
+    setDetail("Status", "Resuming...");
+    banner("ok", "Resuming...");
+  });
 </script>
 </body>
 </html>
