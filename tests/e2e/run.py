@@ -65,8 +65,9 @@ def main():
             ctx = browser.new_context()
             page = ctx.new_page()
             page.on("pageerror", lambda e: errors.append("pageerror: %s" % e))
-            # a 404 is expected where a test asks about an upload that was terminated on purpose
-            page.on("console", lambda m: m.type == "error" and "status of 404" not in m.text and errors.append("console: %s" % m.text))
+            # the browser logs every HTTP error answer; the tests provoke some on purpose (404 after terminate,
+            # 409 and 503 from injected faults and the suite's wrong-offset check), so those are not failures
+            page.on("console", lambda m: m.type == "error" and "Failed to load resource" not in m.text and errors.append("console: %s" % m.text))
 
             def cdn(route):
                 if route.request.url.endswith(".mjs"):
@@ -184,6 +185,34 @@ def main():
             page.wait_for_function("document.getElementById('append-out').textContent.startsWith('Read back')")
             out = page.inner_text("#append-out")
             check("hello one" in out and "hello two" in out, "appended lines read back")
+
+            print("fault injection")
+            check(page.is_visible("#faults-card"), "fault card is shown when served by serve.py")
+            for i, kind in enumerate(("lose_response", "cut_request", "error")):
+                page.select_option("#f-type", kind)
+                page.fill("#f-after", "3")
+                page.fill("#f-times", "1")
+                page.click("#f-apply")
+                page.wait_for_function("document.getElementById('f-state').textContent.includes('Rule:')")
+                add_test_file(page, 2, seed=20 + i)
+                page.click("#stub-upload")
+                wait_detail(page, "Status", "Complete", timeout=30000)
+                page.wait_for_function("document.getElementById('verify-result').textContent.startsWith('Identical')", timeout=15000)
+                resumes = int(detail(page, "Times resumed") or 0)
+                state_txt = json.loads(page.evaluate("fetch('/__tus/faults').then(r => r.text())"))
+                check(state_txt["fired"] == 1, "%s fired once" % kind)
+                check(resumes >= 1, "%s: the uploader resumed (%d) and the file is identical" % (kind, resumes))
+            page.click("#f-clear")
+            page.wait_for_function("document.getElementById('f-state').textContent.startsWith('No fault')")
+            check(True, "faults cleared")
+
+            print("test suite")
+            page.click("#suite-run")
+            page.wait_for_function("document.getElementById('suite-summary').textContent.includes('passed')", timeout=30000)
+            summary = page.inner_text("#suite-summary")
+            check(summary.startswith("18 passed, 0 failed, 0 warnings, 0 skipped"), "suite result: " + summary)
+            check(page.locator("#suite-list li").count() == 18, "one row per check")
+            check(not page.is_disabled("#suite-copy"), "report can be copied")
 
             shot = os.environ.get("SCREENSHOT")
             if shot:

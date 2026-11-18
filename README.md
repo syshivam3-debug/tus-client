@@ -31,6 +31,8 @@ Options: `--port`, `--cafile` (CA bundle for an internal https certificate), `--
 | **Request log** | Every request. Click a line to see its headers and **Copy as curl** (the token is never written; curl reads `$TOKEN`). **Export log** saves JSON for a bug report. |
 | **Interrupted uploads** | Lists unfinished uploads the browser remembers. After **Reload the page**, add the same file again and the upload continues from the server's offset. |
 | **Append mode** | Create an upload with no length (creation-defer-length), append lines, then fix the length to finish. This is the log-file case from the architecture decision. |
+| **Fault injection** | (only through `serve.py`) Break things on purpose: lose the answer to a chunk, cut a chunk in half, answer with an error status, add delay, or limit the speed. Rules say "after N chunks, this many times". Works with `--mock` and with a real service behind `--target`. |
+| **Test suite** | Runs 18 checks against the endpoint (creation, HEAD offset, wrong offset 409, wrong content type 415, finishing, Content-Location, download, 404 for unknown uploads, max size 413, metadata, expiration, deferred length, checksum 460, termination) and shows pass, fail, warn or skip for each. Copy the report into a ticket. |
 
 ## Typical checks
 
@@ -38,12 +40,14 @@ Options: `--port`, `--cafile` (CA bundle for an internal https certificate), `--
 2. **Crash:** start a slow upload, press **Reload the page**, add the same test file (same size and seed), start again. It continues.
 3. **Large file:** generate 500 MB, turn slow mode off, upload, and let **Verify content** confirm it.
 4. **Cleanup:** press Terminate mid-upload. The server must forget it.
+5. **Flaky network:** in Fault injection choose "Lose the answer", after 3 chunks, once. Upload a test file. The log should show the uploader asking HEAD and continuing, and Verify content should pass.
+6. **Regression check:** press Run all tests after a change to the service.
 
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests        # the mock tus server
-node --test tests/lib.test.mjs               # the page's pure helpers (Node 20+)
+node --test tests/lib.test.mjs tests/suite.test.mjs   # the page's helpers and the test suite, run against the mock (Node 20+)
 python3 tests/e2e/run.py                     # drives the page in Chrome (needs playwright for python)
 ```
 
@@ -59,6 +63,9 @@ assets/api.js     one place that makes requests (so they appear in the log)
 assets/log.js     request log, curl, export
 assets/uploader.js  Uppy and the Upload cards
 assets/tools.js   the other cards
+assets/faults.js  fault injection card
+assets/suite.js   the test suite (pure, also run by node)
+assets/suite-ui.js  the test suite card
 assets/lib.js     pure helpers (test file, JWT expiry, byte compare)
 serve.py          local server: page, mock tus server, reverse proxy
 ```

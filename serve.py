@@ -20,6 +20,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import tempfile
@@ -45,6 +46,17 @@ STATIC_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; char
 EXTENSIONS = "creation,creation-defer-length,termination,expiration,checksum"
 CHECKSUMS = {"sha1": hashlib.sha1, "sha256": hashlib.sha256, "md5": hashlib.md5}
 CHUNK = 64 * 1024
+
+FAULT_TYPES = ("none", "lose_response", "cut_request", "error")
+DEFAULT_FAULTS = {"latency_ms": 0, "throttle_kbps": 0,
+                  "rule": {"type": "none", "after": 0, "times": 1, "status": 503}}
+faults = {**json.loads(json.dumps(DEFAULT_FAULTS)), "patches_seen": 0, "fired": 0}
+fault_lock = threading.Lock()
+
+
+class CutConnection(ConnectionError):
+    """Raised on purpose to cut a request body in half (fault injection)."""
+
 
 args = None
 ssl_ctx = None
@@ -74,9 +86,18 @@ class Handler(BaseHTTPRequestHandler):
         print("%s %s" % (self.command, self.path), "->", fmt % a if a else fmt)
 
     # ---- helpers ---------------------------------------------------------
-    unread = 0   # request body bytes not read yet
+    unread = 0     # request body bytes not read yet
+    cut = False    # fault: cut this request's body in half
+    lose = False   # fault: do the work but never answer
 
     def reply(self, status, headers=None, body=b""):
+        if self.lose:                        # fault: the work is done, the answer is lost
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
         self.send_response(status)
         for k, v in (headers or {}).items():
             self.send_header(k, v)
@@ -100,15 +121,23 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def body_chunks(self, length):
-        """The request body, one piece at a time."""
+        """The request body, one piece at a time (slowed down or cut short when a fault says so)."""
         left = length
+        got = 0
+        cut_at = length // 2 if self.cut else None
+        kbps = faults["throttle_kbps"]
         while left > 0:
             data = self.rfile.read(min(CHUNK, left))
             if not data:
                 raise ConnectionError("client disconnected mid-request")
             left -= len(data)
+            got += len(data)
             self.unread -= len(data)
+            if kbps:
+                time.sleep(len(data) / (kbps * 1024.0))
             yield data
+            if cut_at is not None and got >= cut_at and left > 0:
+                raise CutConnection("fault injected: request cut in half")
 
     def serve_static(self, path):
         m = STATIC_PATH.match(path)
@@ -129,7 +158,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.serve_static(path)
         if self.command == "GET" and path == "/__tus/info":
             return self.reply_json(200, {"mode": "mock" if args.mock else "proxy", "target": args.target,
-                                         "faults": False})
+                                         "faults": True})
+        if path == "/__tus/faults":
+            return self.faults_endpoint()
+        if self.apply_faults():
+            return
         if args.mock:
             m = UPLOAD_PATH.match(self.path)
             if m:
@@ -141,6 +174,48 @@ class Handler(BaseHTTPRequestHandler):
         return self.proxy()
 
     do_GET = do_POST = do_HEAD = do_PATCH = do_DELETE = do_OPTIONS = route
+
+    # ---- fault injection -------------------------------------------------
+    def faults_endpoint(self):
+        """GET shows the rules, POST sets them, DELETE clears them."""
+        if self.command == "GET":
+            return self.reply_json(200, fault_state())
+        if self.command == "DELETE":
+            set_faults({})
+            return self.reply_json(200, fault_state())
+        if self.command == "POST":
+            raw = self.rfile.read(self.unread) if self.unread else b"{}"
+            self.unread = 0
+            try:
+                set_faults(json.loads(raw or b"{}"))
+            except (ValueError, TypeError) as e:
+                return self.reply_json(400, {"error": str(e)})
+            return self.reply_json(200, fault_state())
+        return self.reply(405)
+
+    def apply_faults(self):
+        """Apply the current rules to this request. Returns True if the request was already answered."""
+        with fault_lock:
+            latency = faults["latency_ms"]
+            rule = None
+            if self.command == "PATCH":
+                seen = faults["patches_seen"]
+                faults["patches_seen"] += 1
+                r = faults["rule"]
+                if r["type"] != "none" and seen >= r["after"] and faults["fired"] < r["times"]:
+                    faults["fired"] += 1
+                    rule = dict(r)
+        if latency:
+            time.sleep(latency / 1000.0)
+        if rule is None:
+            return False
+        print("  fault: %s (%d of %d)" % (rule["type"], faults["fired"], rule["times"]))
+        if rule["type"] == "error":
+            self.reply(rule["status"], {"Content-Type": "text/plain"}, b"injected fault")
+            return True
+        self.cut = rule["type"] == "cut_request"
+        self.lose = rule["type"] == "lose_response"
+        return False
 
     # ---- mock tus server -------------------------------------------------
     def mock_headers(self, extra=None):
@@ -364,10 +439,39 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(resp.status, out, data)
 
 
+def fault_state():
+    with fault_lock:
+        return {"latency_ms": faults["latency_ms"], "throttle_kbps": faults["throttle_kbps"],
+                "rule": dict(faults["rule"]), "patches_seen": faults["patches_seen"], "fired": faults["fired"]}
+
+
+def set_faults(cfg):
+    """Replace the fault rules (an empty dict clears them) and restart the counters."""
+    def num(v, name, low, high):
+        v = int(v)
+        if not low <= v <= high:
+            raise ValueError("%s must be between %d and %d" % (name, low, high))
+        return v
+    rule_in = cfg.get("rule") or {}
+    rtype = rule_in.get("type", "none")
+    if rtype not in FAULT_TYPES:
+        raise ValueError("rule.type must be one of " + ", ".join(FAULT_TYPES))
+    new = {"latency_ms": num(cfg.get("latency_ms", 0), "latency_ms", 0, 60000),
+           "throttle_kbps": num(cfg.get("throttle_kbps", 0), "throttle_kbps", 0, 10 ** 7),
+           "rule": {"type": rtype, "after": num(rule_in.get("after", 0), "after", 0, 10 ** 6),
+                    "times": num(rule_in.get("times", 1), "times", 1, 10 ** 6),
+                    "status": num(rule_in.get("status", 503), "status", 400, 599)}}
+    with fault_lock:
+        faults.update(new)
+        faults["patches_seen"] = 0
+        faults["fired"] = 0
+
+
 def make_server(port=8000, mock=True, target=None, headers=(), cafile=None, max_size=50 * 1024 ** 3,
                 expire_seconds=3600):
     """Build the server (used by main() and by the tests)."""
     global args, ssl_ctx, tmpdir
+    set_faults({})
     args = argparse.Namespace(mock=mock, target=target, header=list(headers), cafile=cafile, port=port,
                               max_size=max_size, expire_seconds=expire_seconds)
     if target:

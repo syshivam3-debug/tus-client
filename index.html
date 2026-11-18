@@ -142,6 +142,55 @@
     <pre id="append-out" class="out" hidden></pre>
     <small class="hint">Creates an upload without a length, adds lines to it, then fixes the length to finish it. This is the log-file case from the architecture decision (creation-defer-length).</small>
   </details>
+
+  <details class="card" id="faults-card" hidden>
+    <summary><h2>Fault injection</h2></summary>
+    <div class="row">
+      <label class="wide">What to break
+        <select id="f-type">
+          <option value="none">Nothing</option>
+          <option value="lose_response">Lose the answer (the server gets the chunk, the page never hears back)</option>
+          <option value="cut_request">Cut a chunk in half (the connection drops mid-chunk)</option>
+          <option value="error">Answer with an error</option>
+        </select>
+      </label>
+      <label class="narrow">After N chunks
+        <input id="f-after" type="number" min="0" step="1" value="2">
+      </label>
+      <label class="narrow">How many times
+        <input id="f-times" type="number" min="1" step="1" value="1">
+      </label>
+      <label class="narrow">Error status
+        <input id="f-status" type="number" min="400" max="599" step="1" value="503">
+      </label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label class="narrow">Extra delay (ms)
+        <input id="f-latency" type="number" min="0" step="50" value="0">
+      </label>
+      <label class="narrow">Speed limit (KB/s)
+        <input id="f-kbps" type="number" min="0" step="50" value="0">
+      </label>
+      <button id="f-apply" type="button">Apply</button>
+      <button id="f-clear" class="secondary" type="button">Clear</button>
+    </div>
+    <small class="hint" id="f-state">No fault is active.</small>
+    <small class="hint">The faults are added by serve.py between this page and the service. After a lost answer or a cut chunk, the uploader should ask "how much do you have?" (HEAD) and continue from there. (Browsers sometimes re-send a chunk by themselves after a dropped connection; the server then answers 409, which the uploader also has to recover from.) A speed limit gives you time to pause a fast upload.</small>
+  </details>
+
+  <details class="card" id="suite-card">
+    <summary><h2>Test suite</h2></summary>
+    <div class="controls wrap">
+      <button id="suite-run" type="button">Run all tests</button>
+      <button id="suite-copy" class="secondary" type="button" disabled>Copy report</button>
+      <label class="check" style="flex:0 0 auto">
+        <input id="suite-clean" type="checkbox" checked> Delete the test uploads afterwards
+      </label>
+    </div>
+    <div id="suite-summary" class="summary"></div>
+    <ul id="suite-list" class="tests"></ul>
+    <small class="hint">Creates small uploads at the endpoint above and checks the answers against the tus protocol and the extensions in the architecture decision: creating, resuming, wrong offsets, finishing, downloading, expiry, appending, checksums and termination. "Warn" means the service differs from a recommendation; "skip" means it does not advertise that extension yet. It sends real requests, so use a development environment.</small>
+  </details>
 </main>
 
 <script type="module" src="assets/app.js"></script>

@@ -2,6 +2,8 @@
 import { renderDetails, state } from "./core.js";
 import { initLog } from "./log.js";
 import { initUploader } from "./uploader.js";
+import { initFaults } from "./faults.js";
+import { initSuite } from "./suite-ui.js";
 import { initTokenTimer, checkServer, initTestFile, initMetadata, initVerify, initSaved, initAppend } from "./tools.js";
 
 renderDetails();
@@ -13,9 +15,10 @@ initMetadata();
 initVerify();
 initSaved();
 initAppend();
+initSuite();
 document.getElementById("check").addEventListener("click", checkServer);
 
 // serve.py tells the page which mode it runs in (the page also works on a plain static host)
 fetch("/__tus/info").then((r) => (r.ok ? r.json() : null)).then((info) => {
   if (info) state.info = { ...state.info, ...info };
-}).catch(() => {});
+}).catch(() => {}).finally(initFaults);

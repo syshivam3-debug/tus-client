@@ -23,6 +23,7 @@ export class Uppy {
     this.box.querySelector("#stub-upload").addEventListener("click", () => this.upload());
   }
   addFile({ name, type, data }) {
+    this.paused = false;                                  // a new file starts unpaused, as in Uppy
     const file = { id: name + ":" + Math.random(), name, type, size: data.size, data, meta: { name, type } };
     this.files.set(file.id, file);
     this.box.querySelector("#stub-name").textContent = name;
@@ -69,7 +70,7 @@ export class Uppy {
         if (post.status !== 201) throw new Error("failed to create upload: " + post.status);
         s.url = post.headers.get("Location");
         localStorage.setItem("tus::stub::" + file.id, JSON.stringify({ size: file.size, metadata: file.meta, creationTime: new Date().toString(), uploadUrl: new URL(s.url, location.href).href }));
-        let offset = 0, resumed = false;
+        let offset = 0, resumed = false, retries = 0;
         while (offset < file.size) {
           const w = this.#wait(); if (w) { await w; resumed = true; }
           if (s.cancelled) return;
@@ -79,8 +80,19 @@ export class Uppy {
             if (offset >= file.size) break;
           }
           const chunk = file.data.slice(offset, Math.min(file.size, offset + t.chunkSize));
-          const r = await this.#send(s, "PATCH", s.url, { "Upload-Offset": String(offset), "Content-Type": "application/offset+octet-stream" }, chunk);
+          let r;
+          try {
+            r = await this.#send(s, "PATCH", s.url, { "Upload-Offset": String(offset), "Content-Type": "application/offset+octet-stream" }, chunk);
+          } catch (e) {                                   // like tus-js-client: a dropped connection is retried after a HEAD
+            if (s.cancelled) return;
+            if (++retries > 5) throw e;
+            await new Promise((ok) => setTimeout(ok, 200)); resumed = true; continue;
+          }
           if (s.cancelled) return;
+          if (r.status >= 500 || r.status === 409) {     // and so is a 5xx answer, or a 409 (the browser re-sent a chunk the server already has)
+            if (++retries > 5) throw new Error("unexpected status " + r.status);
+            await new Promise((ok) => setTimeout(ok, 200)); resumed = true; continue;
+          }
           if (r.status !== 204) throw new Error("unexpected status " + r.status);
           offset = Number(r.headers.get("Upload-Offset"));
           this.emit("upload-progress", file, { bytesUploaded: offset, bytesTotal: file.size });
