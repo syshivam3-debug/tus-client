@@ -18,6 +18,7 @@ import http.client
 import os
 import re
 import ssl
+import sys
 import tempfile
 import threading
 import uuid
@@ -148,7 +149,12 @@ class Handler(BaseHTTPRequestHandler):
             conn = http.client.HTTPSConnection(t.netloc, timeout=300, context=ssl_ctx)
         else:
             conn = http.client.HTTPConnection(t.netloc, timeout=300)
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in DROP_REQ}
+        # Forward like a plain API client (e.g. Postman): drop browser-only headers that some
+        # gateways use to decide a request is an interactive browser session.
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in DROP_REQ and not k.lower().startswith("sec-")
+                   and k.lower() not in ("accept-language", "user-agent", "cookie", "accept-encoding")}
+        headers["User-Agent"] = "tus-demo-proxy"
         for h in args.header:
             name, _, value = h.partition(":")
             headers[name.strip()] = value.strip()
@@ -177,6 +183,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self.reply(502, {"Content-Type": "text/plain"},
                               ("Could not reach %s: %s" % (args.target, e)).encode())
+        loc = resp.getheader("Location") or ""
+        ctype = (resp.getheader("Content-Type") or "").split(";")[0].strip()
+        sent_auth = any(k.lower() == "authorization" for k in headers)
+        print("  upstream: %s %s  type=%s%s  authorization_sent=%s"
+              % (resp.status, resp.reason, ctype or "-", "  location=" + loc if loc else "", sent_auth))
+        # A browser follows redirects silently, which hides the real problem (usually "not logged in").
+        if 300 <= resp.status < 400 and resp.status != 304:
+            conn.close()
+            return self.reply(401, {"Content-Type": "text/plain"},
+                              ("The service redirected to %r instead of answering. The request was probably not "
+                               "authenticated (authorization_sent=%s). Check the token." % (loc, sent_auth)).encode())
+        if ctype == "text/html" and self.command != "GET":
+            conn.close()
+            return self.reply(502, {"Content-Type": "text/plain"},
+                              ("The service answered %s with a web page, not a tus response. Check the path and "
+                               "the token (authorization_sent=%s)." % (resp.status, sent_auth)).encode())
         out = {}
         for k, v in resp.getheaders():
             kl = k.lower()
@@ -193,7 +215,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global args, ssl_ctx, tmpdir
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sys.stdout.reconfigure(line_buffering=True)   # show log lines immediately, even when piped
+    ap =argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--target", help="origin of the real service, e.g. https://dev-host:8443")
     mode.add_argument("--mock", action="store_true", help="run a built-in tus server instead")

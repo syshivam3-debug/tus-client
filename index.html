@@ -144,7 +144,9 @@
       storeFingerprintForResuming: true,
       removeFingerprintOnSuccess: true,
       async onBeforeRequest(req) {
-        const token = $("auth").value.trim();
+        let token = $("auth").value.trim();
+        // a bare token (no scheme) is the most common slip: add "Bearer " for it
+        if (token && !/^\w+\s/.test(token)) token = "Bearer " + token;
         if (token) req.setHeader("Authorization", token);
       },
       async onAfterResponse(req, res) {
