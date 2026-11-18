@@ -52,7 +52,7 @@
         <input id="endpoint" value="/files/uploads" spellcheck="false">
       </label>
       <label class="narrow">Chunk size (MB)
-        <input id="chunk" type="number" min="1" step="1" value="2">
+        <input id="chunk" type="number" min="0.05" step="any" value="2">
       </label>
       <label>Authorization header (optional)
         <input id="auth" placeholder="Bearer &lt;token&gt;" spellcheck="false" autocomplete="off">
@@ -78,7 +78,12 @@
       <div class="stat"><b id="s-bytes">0 B of 0 B</b><span>Received so far</span></div>
       <div class="stat"><b id="s-resumes">0</b><span>Times resumed</span></div>
       <div class="stat"><b id="s-offset">-</b><span>Last offset reported by the server</span></div>
+      <div class="stat"><b id="s-loc" style="font-size:15px;word-break:break-all">-</b><span>File location once complete</span></div>
     </div>
+    <div class="controls">
+      <button id="details" class="secondary" type="button" disabled>Show file details</button>
+    </div>
+    <pre id="details-out" style="margin:12px 0 0;white-space:pre-wrap;font-size:13px"></pre>
   </section>
 
   <section class="card">
@@ -122,7 +127,16 @@
     ol.scrollTop = ol.scrollHeight;
   };
 
-  const chunkBytes = () => Math.max(1, Number($("chunk").value) || 2) * MB;
+  // any size from 50 KB up, so even a small test file is sent in several chunks
+  const chunkBytes = () => Math.max(50 * 1024, Math.round((Number($("chunk").value) || 2) * MB));
+
+  // the Authorization header value from the form; a bare token gets "Bearer " added
+  const authHeader = () => {
+    let token = $("auth").value.trim();
+    if (token && !/^\w+\s/.test(token)) token = "Bearer " + token;
+    return token;
+  };
+  let fileLocation = null;   // Content-Location from the final PATCH response
 
   const uppy = new Uppy({ autoProceed: false, restrictions: { maxNumberOfFiles: 1 } })
     .use(Dashboard, {
@@ -144,9 +158,7 @@
       storeFingerprintForResuming: true,
       removeFingerprintOnSuccess: true,
       async onBeforeRequest(req) {
-        let token = $("auth").value.trim();
-        // a bare token (no scheme) is the most common slip: add "Bearer " for it
-        if (token && !/^\w+\s/.test(token)) token = "Bearer " + token;
+        const token = authHeader();
         if (token) req.setHeader("Authorization", token);
       },
       async onAfterResponse(req, res) {
@@ -168,6 +180,14 @@
             extra = " -> Upload-Offset not readable (CORS: expose it, or use serve.py)";
           }
         }
+        // when the last chunk lands, the service reports where the finished file lives
+        const contentLocation = res.getHeader("Content-Location");
+        if (contentLocation) {
+          fileLocation = contentLocation;
+          $("s-loc").textContent = contentLocation;
+          $("details").disabled = false;
+          extra += " -> file is at " + contentLocation;
+        }
         logLine(method, status + "  " + url + extra);
       },
     });
@@ -176,7 +196,9 @@
     $("s-bytes").textContent = fmt(p.bytesUploaded) + " of " + fmt(p.bytesTotal);
   });
   uppy.on("upload-success", (file, resp) => {
-    banner("ok", "Upload complete" + (resp && resp.uploadURL ? ": " + resp.uploadURL : "."));
+    banner("ok", fileLocation
+      ? "Upload complete. The file is at " + fileLocation
+      : "Upload complete" + (resp && resp.uploadURL ? ": " + resp.uploadURL : "."));
   });
   uppy.on("upload-error", (file, err) => {
     const msg = String((err && err.message) || err);
@@ -191,6 +213,23 @@
   $("apply").addEventListener("click", () => {
     tus().setOptions({ endpoint: $("endpoint").value.trim(), chunkSize: chunkBytes() });
     banner("ok", "Settings applied: " + $("endpoint").value.trim() + ", " + (chunkBytes() / MB) + " MB chunks.");
+  });
+  $("details").addEventListener("click", async () => {
+    if (!fileLocation) return;
+    const out = $("details-out");
+    try {
+      // use only the path so the request goes through this page's own server (no CORS)
+      const u = new URL(fileLocation, location.href);
+      const headers = { Accept: "application/json" };
+      if (authHeader()) headers.Authorization = authHeader();
+      const r = await fetch(u.pathname + u.search, { headers });
+      if (!r.ok) { out.textContent = "The service answered " + r.status + " for " + u.pathname; return; }
+      const f = await r.json();
+      out.textContent = ["name", "id", "size", "contentType", "createdBy", "creationTimeStamp"]
+        .filter((k) => f[k] !== undefined).map((k) => k + ": " + f[k]).join("\n");
+    } catch (e) {
+      out.textContent = "Could not read the file details: " + e.message;
+    }
   });
   $("pause").addEventListener("click", () => { uppy.pauseAll(); banner("warn", "Paused. The server keeps what it already received."); });
   $("resume").addEventListener("click", () => { uppy.resumeAll(); banner("ok", "Resuming..."); });

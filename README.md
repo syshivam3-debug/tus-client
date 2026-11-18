@@ -20,7 +20,7 @@ Options: `--port`, `--cafile` (CA bundle for an internal https certificate), `--
 
 ## Demo script
 
-1. Pick a file of a few hundred MB and press Upload. Use a 2 MB chunk size so the offsets move in steps.
+1. Pick a file of a few hundred MB and press Upload. Set the chunk size so the offsets move in steps (any value from 0.05 MB up; for a 1 MB file try 0.1).
 2. Press **Pause** (or switch the browser's Network tab to Offline). The server keeps what it received.
 3. Press **Resume** (or go back online). The log shows a `HEAD` request, then `PATCH` continuing from the reported offset.
 4. Optional: reload the page mid-upload and add the same file again. The client finds the unfinished upload and continues it.

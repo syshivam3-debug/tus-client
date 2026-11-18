@@ -204,7 +204,7 @@ class Handler(BaseHTTPRequestHandler):
             kl = k.lower()
             if kl in HOP or kl == "content-length":
                 continue
-            if kl == "location":
+            if kl in ("location", "content-location"):
                 p = urlsplit(v)
                 if p.netloc == t.netloc:   # keep follow-up requests on this origin
                     v = p.path + ("?" + p.query if p.query else "")
