@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Resumable upload demo (tus + Uppy)</title>
+  <title>Resumable upload (tus + Uppy)</title>
   <!-- Uppy is loaded from Transloadit's CDN (pinned version). No build step needed. -->
   <link rel="stylesheet" href="https://releases.transloadit.com/uppy/v5.2.1/uppy.min.css">
   <style>
@@ -66,10 +66,10 @@
       <button id="apply" class="secondary" type="button">Apply</button>
       <label class="check">
         <input id="demo" type="checkbox" checked>
-        Slow demo mode: split any file into about 8 chunks and wait 1 second between them, so there is time to pause
+        Slow mode: split any file into about 8 chunks and wait 1 second between them, so there is time to pause
       </label>
     </div>
-    <small class="hint">The token is kept in memory only and is never saved. With demo mode off, the chunk size above is used and nothing is slowed down.</small>
+    <small class="hint">With slow mode off, the chunk size above is used and nothing is slowed down.</small>
   </section>
 
   <section class="card">
