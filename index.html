@@ -6,45 +6,7 @@
   <title>Resumable upload (tus + Uppy)</title>
   <!-- Uppy is loaded from Transloadit's CDN (pinned version). No build step needed. -->
   <link rel="stylesheet" href="https://releases.transloadit.com/uppy/v5.2.1/uppy.min.css">
-  <style>
-    :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#5d6978; --line:#dde2e8; --accent:#1a6cf0; --ok:#157f3b; --warn:#b45309; --bad:#b42318; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg:#11151a; --card:#1a2028; --text:#e8ecf1; --muted:#9aa6b4; --line:#2b3440; --accent:#6aa1ff; --ok:#5fd28a; --warn:#f0a95a; --bad:#ff8a80; }
-    }
-    * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-    main { max-width: 860px; margin: 0 auto; padding: 28px 20px 60px; }
-    h1 { font-size: 28px; margin: 0 0 4px; }
-    .lead { color: var(--muted); margin: 0 0 24px; }
-    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 18px; }
-    .card h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
-    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
-    label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); flex: 1 1 200px; }
-    label.narrow { flex: 0 0 150px; }
-    label.check { flex: 1 1 100%; flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 14px; }
-    input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
-    input[type=checkbox] { width: 18px; height: 18px; padding: 0; }
-    button { font: inherit; border: 0; border-radius: 8px; padding: 9px 16px; cursor: pointer; background: var(--accent); color: #fff; font-weight: 600; }
-    button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
-    button:disabled { opacity: .5; cursor: default; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
-    .stat b { display: block; font-size: 24px; line-height: 1.2; }
-    .stat span { color: var(--muted); font-size: 13px; }
-    .kv { display: grid; grid-template-columns: 190px 1fr; gap: 6px 14px; font-size: 14px; }
-    .kv .k { color: var(--muted); }
-    .kv .v { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .kv .empty { grid-column: 1 / -1; color: var(--muted); }
-    .banner { margin-top: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); display: none; }
-    .banner.show { display: block; }
-    .banner.ok { color: var(--ok); } .banner.warn { color: var(--warn); } .banner.bad { color: var(--bad); }
-    .controls { display: flex; gap: 10px; margin-top: 12px; }
-    ol#log { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow: auto; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    ol#log li { padding: 2px 0; border-bottom: 1px dashed var(--line); }
-    .m { display:inline-block; min-width: 56px; font-weight: 700; }
-    .m.POST { color: var(--accent); } .m.PATCH { color: var(--ok); } .m.HEAD { color: var(--warn); } .m.DELETE, .m.ERROR { color: var(--bad); }
-    small.hint { color: var(--muted); display:block; margin-top: 8px; }
-    .uppy-Dashboard-inner { max-width: 100%; }
-  </style>
+  <link rel="stylesheet" href="assets/app.css">
 </head>
 <body>
 <main>
@@ -59,11 +21,13 @@
       </label>
       <label>Authorization header (optional)
         <input id="auth" placeholder="Bearer &lt;token&gt;" spellcheck="false" autocomplete="off">
+        <span id="token-hint" class="sub"></span>
       </label>
       <label class="narrow">Chunk size (MB)
         <input id="chunk" type="number" min="0.02" step="any" value="2">
       </label>
       <button id="apply" class="secondary" type="button">Apply</button>
+      <button id="check" class="secondary" type="button">Check server</button>
       <label class="check">
         <input id="demo" type="checkbox" checked>
         Slow mode: split any file into about 8 chunks and wait 1 second between them, so there is time to pause
@@ -72,12 +36,50 @@
     <small class="hint">With slow mode off, the chunk size above is used and nothing is slowed down.</small>
   </section>
 
+  <details class="card" id="caps-card">
+    <summary><h2>Server check</h2></summary>
+    <div id="caps" class="kv"><div class="empty">Press "Check server" in the Connection card to see what the service says it supports.</div></div>
+    <small class="hint">Sends OPTIONS to the endpoint and compares the extensions with the ones the architecture decision asks for.</small>
+  </details>
+
+  <details class="card" id="gen-card">
+    <summary><h2>Test file</h2></summary>
+    <div class="row">
+      <label class="narrow">Size (MB)
+        <input id="gen-size" type="number" min="0.001" max="4096" step="any" value="5">
+      </label>
+      <label class="narrow">Seed
+        <input id="gen-seed" type="number" min="0" step="1" value="1">
+      </label>
+      <label>File name (optional)
+        <input id="gen-name" placeholder="test-5MB-seed1.bin" spellcheck="false">
+      </label>
+      <button id="gen-go" type="button">Add to upload</button>
+    </div>
+    <div class="controls wrap">
+      <button class="secondary small" type="button" data-gen-mb="1">1 MB</button>
+      <button class="secondary small" type="button" data-gen-mb="10">10 MB</button>
+      <button class="secondary small" type="button" data-gen-mb="100">100 MB</button>
+      <button class="secondary small" type="button" data-gen-mb="500">500 MB</button>
+    </div>
+    <small class="hint" id="gen-status">Creates a file in the browser, so no file on disk is needed. The same size and seed always give the same bytes, so you can add "the same file" again after a reload.</small>
+  </details>
+
+  <details class="card" id="meta-card">
+    <summary><h2>Upload metadata</h2></summary>
+    <div id="meta-rows" class="rows"></div>
+    <div class="controls"><button id="meta-add" class="secondary small" type="button">Add field</button></div>
+    <small class="hint" id="meta-note">Only the file name and type are sent.</small>
+  </details>
+
   <section class="card">
     <h2>Upload</h2>
     <div id="dashboard"></div>
     <div class="controls">
       <button id="pause" class="secondary" type="button">Pause</button>
       <button id="resume" class="secondary" type="button">Resume</button>
+      <span class="grow"></span>
+      <button id="terminate" class="secondary" type="button">Terminate</button>
     </div>
     <div id="banner" class="banner" role="status"></div>
   </section>
@@ -94,261 +96,54 @@
   <section class="card">
     <h2>Upload details</h2>
     <div id="details" class="kv"></div>
-    <div class="controls">
+    <div class="controls wrap">
       <button id="refresh" class="secondary" type="button" disabled>Refresh file record</button>
+      <button id="verify" class="secondary" type="button" disabled>Verify content</button>
+      <label class="check" style="flex:0 0 auto">
+        <input id="verify-auto" type="checkbox" checked> Verify automatically when an upload completes
+      </label>
     </div>
-    <small class="hint">Fills in as information becomes available: file, upload session, progress, then the finished file.</small>
+    <pre id="verify-result" class="out" hidden></pre>
+    <small class="hint">Fills in as information becomes available: file, upload session, progress, then the finished file. "Verify content" downloads the finished file and compares it with the original, byte for byte.</small>
   </section>
 
   <section class="card">
     <h2>Request log</h2>
     <ol id="log"></ol>
-    <small class="hint">POST creates the upload, PATCH sends a chunk, HEAD asks "how much do you have?" when the client resumes.</small>
+    <div class="controls">
+      <button id="log-export" class="secondary small" type="button">Export log (JSON)</button>
+      <button id="log-clear" class="secondary small" type="button">Clear</button>
+    </div>
+    <small class="hint">POST creates the upload, PATCH sends a chunk, HEAD asks "how much do you have?" when the client resumes. Click a line to see its headers or copy it as a curl command.</small>
   </section>
+
+  <details class="card" id="saved-card">
+    <summary><h2>Interrupted uploads</h2></summary>
+    <div id="saved-list"></div>
+    <div class="controls">
+      <button id="saved-reload" class="secondary small" type="button">Reload the page (simulate a crash)</button>
+    </div>
+    <small class="hint">The browser remembers where each unfinished upload lives. After a reload, add the same file again (for a test file, use the same size and seed) and the upload continues from what the server has.</small>
+  </details>
+
+  <details class="card" id="append-card">
+    <summary><h2>Append mode</h2></summary>
+    <div class="row">
+      <label class="wide">Line to append
+        <input id="append-line" value="2026-11-18 log line" spellcheck="false">
+      </label>
+    </div>
+    <div class="controls wrap">
+      <button id="append-start" class="secondary" type="button">Start log upload</button>
+      <button id="append-add" class="secondary" type="button">Append line</button>
+      <button id="append-finish" class="secondary" type="button">Finish</button>
+      <button id="append-read" class="secondary" type="button">Read it back</button>
+    </div>
+    <pre id="append-out" class="out" hidden></pre>
+    <small class="hint">Creates an upload without a length, adds lines to it, then fixes the length to finish it. This is the log-file case from the architecture decision (creation-defer-length).</small>
+  </details>
 </main>
 
-<script type="module">
-  import { Uppy, Dashboard, Tus } from "https://releases.transloadit.com/uppy/v5.2.1/uppy.min.mjs";
-
-  const $ = (id) => document.getElementById(id);
-  const MB = 1024 * 1024;
-  const MIN_CHUNK = 16 * 1024;     // smallest chunk we will use
-  const TARGET_CHUNKS = 8;         // demo mode aims for about this many chunks per file
-  const PACE_MS = 1000;            // demo mode waits this long before each chunk
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  let resumes = 0;
-  let chunksSent = 0;
-  let fileSize = 0;
-  let fileLocation = null;         // Content-Location from the final PATCH response
-
-  const fmt = (n) => {
-    if (n == null || Number.isNaN(Number(n))) return "-";
-    n = Number(n);
-    if (n < 1024) return n + " B";
-    if (n < MB) return (n / 1024).toFixed(1) + " KB";
-    if (n < 1024 * MB) return (n / MB).toFixed(1) + " MB";
-    return (n / (1024 * MB)).toFixed(2) + " GB";
-  };
-
-  const banner = (kind, text) => {
-    const b = $("banner");
-    b.className = "banner show " + kind;
-    b.textContent = text;
-  };
-
-  const logLine = (method, text) => {
-    const li = document.createElement("li");
-    const m = document.createElement("span");
-    m.className = "m " + method;
-    m.textContent = method;
-    li.append(new Date().toLocaleTimeString() + "  ", m, " " + text);
-    const ol = $("log");
-    ol.append(li);
-    ol.scrollTop = ol.scrollHeight;
-  };
-
-  // ---- live details: rows are added as soon as the information exists ----
-  const details = new Map();
-  const renderDetails = () => {
-    const box = $("details");
-    box.replaceChildren();
-    if (!details.size) {
-      const d = document.createElement("div");
-      d.className = "empty";
-      d.textContent = "Nothing yet. Add a file to begin.";
-      box.append(d);
-      return;
-    }
-    for (const [k, v] of details) {
-      const a = document.createElement("span"); a.className = "k"; a.textContent = k;
-      const b = document.createElement("span"); b.className = "v"; b.textContent = v;
-      box.append(a, b);
-    }
-  };
-  const setDetail = (key, value) => { details.set(key, String(value)); renderDetails(); };
-  renderDetails();
-
-  const pathOf = (u) => { const x = new URL(u, location.href); return x.pathname + x.search; };
-  const lastSegment = (p) => p.split("?")[0].split("/").filter(Boolean).pop() || "";
-
-  // the Authorization header value from the form; a bare token gets "Bearer " added
-  const authHeader = () => {
-    let token = $("auth").value.trim();
-    if (token && !/^\w+\s/.test(token)) token = "Bearer " + token;
-    return token;
-  };
-
-  const manualChunk = () => Math.max(MIN_CHUNK, Math.round((Number($("chunk").value) || 2) * MB));
-
-  const uppy = new Uppy({ autoProceed: false, restrictions: { maxNumberOfFiles: 1 } })
-    .use(Dashboard, {
-      inline: true,
-      target: "#dashboard",
-      height: 320,
-      width: "100%",
-      showProgressDetails: true,
-      proudlyDisplayPoweredByUppy: false,
-      note: "One file at a time. Large files are sent in chunks.",
-    })
-    .use(Tus, {
-      endpoint: $("endpoint").value.trim(),
-      chunkSize: manualChunk(),
-      // keep retrying for a while so a short network drop heals by itself
-      retryDelays: [0, 1000, 3000, 5000, 10000, 10000, 10000],
-      limit: 1,
-      // remember the upload URL in localStorage so a page reload can resume too
-      storeFingerprintForResuming: true,
-      removeFingerprintOnSuccess: true,
-      async onBeforeRequest(req) {
-        const token = authHeader();
-        if (token) req.setHeader("Authorization", token);
-        // demo mode: pause before every chunk so there is time to click Pause
-        if (req.getMethod() === "PATCH" && $("demo").checked) await sleep(PACE_MS);
-      },
-      async onAfterResponse(req, res) {
-        const method = req.getMethod();
-        const status = res.getStatus();
-        const offset = res.getHeader("Upload-Offset");
-        const url = req.getURL().replace(/^https?:\/\/[^/]+/, "");
-        let extra = "";
-
-        if (method === "POST" && status === 201) {
-          const loc = res.getHeader("Location");
-          if (loc) {
-            setDetail("Upload ID", lastSegment(pathOf(loc)));
-            setDetail("Upload URL", pathOf(loc));
-          }
-          setDetail("Status", "Upload session created on the server");
-        }
-        if (method === "PATCH" && status === 204 && offset != null) {
-          chunksSent += 1;
-          $("s-offset").textContent = fmt(offset);
-          extra = " -> server has " + fmt(offset);
-          setDetail("Chunks sent", chunksSent);
-          setDetail("Received by server", fmt(offset) + (fileSize ? " of " + fmt(fileSize) : ""));
-          if (!fileLocation) setDetail("Status", "Uploading");
-        }
-        if (method === "HEAD" && status === 200) {
-          if (offset != null) {
-            resumes += 1;
-            $("s-resumes").textContent = String(resumes);
-            $("s-offset").textContent = fmt(offset);
-            extra = " -> server remembers " + fmt(offset);
-            setDetail("Times resumed", resumes);
-            setDetail("Status", "Resumed: server remembers " + fmt(offset));
-            banner("warn", "Connection restored. Continuing from " + fmt(offset) + " instead of starting over.");
-          } else {
-            extra = " -> Upload-Offset not readable (CORS: expose it, or use serve.py)";
-          }
-        }
-        // when the last chunk lands, the service reports where the finished file lives
-        const contentLocation = res.getHeader("Content-Location");
-        if (contentLocation && contentLocation !== fileLocation) {
-          fileLocation = contentLocation;
-          setDetail("File location", contentLocation);
-          setDetail("File ID", lastSegment(pathOf(contentLocation)));
-          setDetail("Status", "Finalized by the server");
-          $("refresh").disabled = false;
-          extra += " -> file is at " + contentLocation;
-          fetchRecord();
-        }
-        logLine(method, status + "  " + url + extra);
-      },
-    });
-
-  const tus = () => uppy.getPlugin("Tus");
-  const pausedAt = () => { const o = $("s-offset").textContent; return o === "-" ? "" : " at " + o; };
-
-  // demo mode picks a chunk size from the file size; otherwise the field decides
-  const applyChunkSize = () => {
-    const size = $("demo").checked && fileSize
-      ? Math.max(MIN_CHUNK, Math.ceil(fileSize / TARGET_CHUNKS))
-      : manualChunk();
-    tus().setOptions({ chunkSize: size });
-    return size;
-  };
-
-  // read the finished file's record from the file service
-  async function fetchRecord() {
-    if (!fileLocation) return;
-    const path = pathOf(fileLocation);   // path only, so it goes through this page's own server
-    setDetail("File record", "reading " + path + " ...");
-    try {
-      const headers = { Accept: "application/json" };
-      if (authHeader()) headers.Authorization = authHeader();
-      const r = await fetch(path, { headers });
-      if (!r.ok) { setDetail("File record", "the service answered " + r.status + " for " + path); return; }
-      const f = await r.json();
-      details.delete("File record");
-      const fields = [["name", "Name on server"], ["size", "Size on server"], ["contentType", "Content type"],
-                      ["createdBy", "Created by"], ["creationTimeStamp", "Created at"], ["fileStatus", "File status"]];
-      for (const [k, label] of fields) {
-        if (f[k] !== undefined) details.set(label, k === "size" ? fmt(f.size) + " (" + f.size + " bytes)" : f[k]);
-      }
-      renderDetails();
-    } catch (e) {
-      setDetail("File record", "could not read it: " + e.message);
-    }
-  }
-
-  uppy.on("file-added", (file) => {
-    details.clear();
-    resumes = 0; chunksSent = 0; fileLocation = null;
-    fileSize = file.size || 0;
-    $("s-resumes").textContent = "0";
-    $("s-offset").textContent = "-";
-    $("s-bytes").textContent = "0 B of " + fmt(fileSize);
-    $("refresh").disabled = true;
-    $("banner").className = "banner";
-    setDetail("Status", "Ready to upload");
-    setDetail("File name", file.name);
-    setDetail("File size", fmt(fileSize) + " (" + fileSize + " bytes)");
-    setDetail("File type", file.type || "unknown");
-    const c = applyChunkSize();
-    setDetail("Chunk size", fmt(c) + ($("demo").checked ? " (about " + Math.ceil(fileSize / c) + " chunks, 1 s apart)" : ""));
-  });
-  uppy.on("upload", () => setDetail("Status", "Connecting to the server"));
-  uppy.on("upload-progress", (file, p) => {
-    $("s-bytes").textContent = fmt(p.bytesUploaded) + " of " + fmt(p.bytesTotal);
-    if (p.bytesTotal) setDetail("Progress", Math.floor((p.bytesUploaded / p.bytesTotal) * 100) + "%");
-  });
-  uppy.on("upload-pause", (fileID, isPaused) => {
-    setDetail("Status", isPaused ? "Paused" + pausedAt() : "Resuming...");
-  });
-  uppy.on("upload-success", (file, resp) => {
-    setDetail("Status", "Complete");
-    banner("ok", fileLocation
-      ? "Upload complete. The file is at " + fileLocation
-      : "Upload complete" + (resp && resp.uploadURL ? ": " + resp.uploadURL : "."));
-  });
-  uppy.on("upload-error", (file, err) => {
-    const msg = String((err && err.message) || err);
-    logLine("ERROR", msg.split("\n")[0]);
-    setDetail("Status", "Stopped: " + msg.split("\n")[0]);
-    const unreachable = /failed to create upload|network|status 0|Failed to fetch/i.test(msg);
-    banner("bad", unreachable
-      ? "The browser could not talk to the service. Check the endpoint, and see the CORS note in the README (or run serve.py)."
-      : "Upload stopped: " + msg.split("\n")[0] + ". Press Retry in the upload panel to continue.");
-  });
-
-  $("apply").addEventListener("click", () => {
-    tus().setOptions({ endpoint: $("endpoint").value.trim() });
-    const c = applyChunkSize();
-    banner("ok", "Settings applied: " + $("endpoint").value.trim() + ", chunk size " + fmt(c) + ".");
-  });
-  $("demo").addEventListener("change", applyChunkSize);
-  $("refresh").addEventListener("click", fetchRecord);
-  $("pause").addEventListener("click", () => {
-    uppy.pauseAll();
-    setDetail("Status", "Paused" + pausedAt());
-    banner("warn", "Paused. The server keeps what it already received.");
-  });
-  $("resume").addEventListener("click", () => {
-    uppy.resumeAll();
-    setDetail("Status", "Resuming...");
-    banner("ok", "Resuming...");
-  });
-</script>
+<script type="module" src="assets/app.js"></script>
 </body>
 </html>

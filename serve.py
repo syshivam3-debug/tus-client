@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """Local server for the tus upload page. Python 3.8+, standard library only.
 
-It serves index.html and, on the same origin, either
+It serves the page (index.html and assets/) and, on the same origin, either
 
   --target URL   forwards every other request to a real tus service
                  (so the browser never makes a cross-origin call and CORS
                  does not matter), or
-  --mock         answers tus requests itself, so you can rehearse the upload
-                 before the real environment is ready.
+  --mock         answers tus requests itself, so you can try the page and the
+                 tools before the real environment is ready.
 
 Examples:
   python3 serve.py --mock
   python3 serve.py --target https://dev-host.example.com --header "Authorization: Bearer <token>"
 """
 import argparse
+import base64
+import hashlib
 import http.client
+import json
 import os
 import re
 import ssl
 import sys
 import tempfile
 import threading
+import time
 import uuid
+from datetime import datetime, timezone
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -31,13 +37,34 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 # not forwarded: the service may reject a request that carries a foreign Origin
 DROP_REQ = HOP | {"host", "origin", "referer", "content-length"}
 UPLOAD_PATH = re.compile(r"^(?P<base>.*/uploads)(?:/(?P<id>[^/?]+))?/?(?:\?.*)?$")
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+FILE_PATH = re.compile(r"^(?P<parent>.*?)/(?P<id>%s)(?P<content>/content)?/?(?:\?.*)?$" % UUID)
+STATIC_PATH = re.compile(r"^/assets/(?P<name>[A-Za-z0-9._-]+)$")
+STATIC_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+                ".html": "text/html; charset=utf-8", ".json": "application/json"}
+EXTENSIONS = "creation,creation-defer-length,termination,expiration,checksum"
+CHECKSUMS = {"sha1": hashlib.sha1, "sha256": hashlib.sha256, "md5": hashlib.md5}
 CHUNK = 64 * 1024
 
 args = None
 ssl_ctx = None
-uploads = {}              # mock state: id -> {"length", "offset", "path", "meta"}
+uploads = {}              # mock state: id -> upload record (see mock_create)
 lock = threading.Lock()
 tmpdir = None
+
+
+def parse_metadata(header):
+    """'filename aGk=,filetype dGV4dA==' -> {'filename': 'hi', 'filetype': 'text'}"""
+    out = {}
+    for pair in (header or "").split(","):
+        key, _, val = pair.strip().partition(" ")
+        if not key:
+            continue
+        try:
+            out[key] = base64.b64decode(val).decode("utf-8", "replace") if val else ""
+        except ValueError:
+            out[key] = ""
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -47,15 +74,24 @@ class Handler(BaseHTTPRequestHandler):
         print("%s %s" % (self.command, self.path), "->", fmt % a if a else fmt)
 
     # ---- helpers ---------------------------------------------------------
+    unread = 0   # request body bytes not read yet
+
     def reply(self, status, headers=None, body=b""):
         self.send_response(status)
         for k, v in (headers or {}).items():
             self.send_header(k, v)
+        if self.unread > 0:                  # answered without reading the body: do not reuse the connection
+            self.send_header("Connection", "close")
+            self.close_connection = True
         if status != 204 and self.command != "HEAD":
             self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
+
+    def reply_json(self, status, obj):
+        self.reply(status, {"Content-Type": "application/json", "Cache-Control": "no-store"},
+                   json.dumps(obj).encode())
 
     def tus_ok(self):
         if self.headers.get("Tus-Resumable") != "1.0.0":
@@ -63,50 +99,93 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def body_chunks(self, length):
+        """The request body, one piece at a time."""
+        left = length
+        while left > 0:
+            data = self.rfile.read(min(CHUNK, left))
+            if not data:
+                raise ConnectionError("client disconnected mid-request")
+            left -= len(data)
+            self.unread -= len(data)
+            yield data
+
+    def serve_static(self, path):
+        m = STATIC_PATH.match(path)
+        name = "index.html" if path in ("/", "/index.html") else (m.group("name") if m else None)
+        full = os.path.join(HERE, "assets", name) if m else os.path.join(HERE, "index.html")
+        if name is None or not os.path.isfile(full):
+            return self.reply(404, body=b"not found")
+        with open(full, "rb") as f:
+            data = f.read()
+        ctype = STATIC_TYPES.get(os.path.splitext(name)[1], "application/octet-stream")
+        self.reply(200, {"Content-Type": ctype, "Cache-Control": "no-store"}, data)
+
     # ---- routing ---------------------------------------------------------
     def route(self):
-        if self.command == "GET" and self.path.split("?")[0] in ("/", "/index.html"):
-            with open(os.path.join(HERE, "index.html"), "rb") as f:
-                return self.reply(200, {"Content-Type": "text/html; charset=utf-8"}, f.read())
+        self.unread = int(self.headers.get("Content-Length") or 0)
+        path = self.path.split("?")[0]
+        if self.command == "GET" and (path in ("/", "/index.html") or STATIC_PATH.match(path)):
+            return self.serve_static(path)
+        if self.command == "GET" and path == "/__tus/info":
+            return self.reply_json(200, {"mode": "mock" if args.mock else "proxy", "target": args.target,
+                                         "faults": False})
         if args.mock:
             m = UPLOAD_PATH.match(self.path)
             if m:
                 return self.mock(m.group("base"), m.group("id"))
+            f = FILE_PATH.match(self.path)
+            if f and self.command in ("GET", "HEAD"):
+                return self.mock_file(f.group("id"), bool(f.group("content")))
             return self.reply(404, body=b"mock server only implements tus uploads")
         return self.proxy()
 
     do_GET = do_POST = do_HEAD = do_PATCH = do_DELETE = do_OPTIONS = route
 
     # ---- mock tus server -------------------------------------------------
+    def mock_headers(self, extra=None):
+        h = {"Tus-Resumable": "1.0.0"}
+        h.update(extra or {})
+        return h
+
+    def mock_lookup(self, upload_id):
+        """The upload record, or None. Unfinished uploads that outlived their expiry are removed."""
+        with lock:
+            up = uploads.get(upload_id or "")
+            if up and not up["done"] and time.time() > up["expires"]:
+                uploads.pop(upload_id, None)
+                try:
+                    os.remove(up["path"])
+                except OSError:
+                    pass
+                return None
+            return up
+
     def mock(self, base, upload_id):
         cmd = self.command
+        parent = base[: -len("/uploads")]
         if cmd == "OPTIONS" and upload_id is None:
-            return self.reply(204, {"Tus-Resumable": "1.0.0", "Tus-Version": "1.0.0",
-                                    "Tus-Extension": "creation,termination",
-                                    "Tus-Max-Size": str(args.max_size)})
+            return self.reply(204, self.mock_headers({
+                "Tus-Version": "1.0.0", "Tus-Extension": EXTENSIONS,
+                "Tus-Max-Size": str(args.max_size), "Tus-Checksum-Algorithm": ",".join(CHECKSUMS)}))
         if not self.tus_ok():
             return
         if cmd == "POST" and upload_id is None:
-            try:
-                length = int(self.headers["Upload-Length"])
-            except (KeyError, ValueError):
-                return self.reply(400, body=b"Upload-Length is required")
-            if length > args.max_size:
-                return self.reply(413, body=b"Upload-Length exceeds the maximum size")
-            uid = str(uuid.uuid4())
-            path = os.path.join(tmpdir, uid)
-            open(path, "wb").close()
-            with lock:
-                uploads[uid] = {"length": length, "offset": 0, "path": path,
-                                "meta": self.headers.get("Upload-Metadata", "")}
-            return self.reply(201, {"Tus-Resumable": "1.0.0", "Location": "%s/%s" % (base, uid)})
-        up = uploads.get(upload_id or "")
+            return self.mock_create(base)
+        up = self.mock_lookup(upload_id)
         if up is None:
-            return self.reply(404, {"Tus-Resumable": "1.0.0"})
+            return self.reply(404, self.mock_headers())
         if cmd == "HEAD":
-            return self.reply(200, {"Tus-Resumable": "1.0.0", "Cache-Control": "no-store",
-                                    "Upload-Offset": str(up["offset"]),
-                                    "Upload-Length": str(up["length"])})
+            h = {"Cache-Control": "no-store", "Upload-Offset": str(up["offset"])}
+            if up["length"] is None:
+                h["Upload-Defer-Length"] = "1"
+            else:
+                h["Upload-Length"] = str(up["length"])
+            if up["meta"]:
+                h["Upload-Metadata"] = up["meta"]
+            if not up["done"]:
+                h["Upload-Expires"] = formatdate(up["expires"], usegmt=True)
+            return self.reply(200, self.mock_headers(h))
         if cmd == "DELETE":
             with lock:
                 uploads.pop(upload_id, None)
@@ -114,33 +193,112 @@ class Handler(BaseHTTPRequestHandler):
                 os.remove(up["path"])
             except OSError:
                 pass
-            return self.reply(204, {"Tus-Resumable": "1.0.0"})
+            return self.reply(204, self.mock_headers())
         if cmd == "PATCH":
-            if self.headers.get("Content-Type") != "application/offset+octet-stream":
-                return self.reply(415)
-            try:
-                offset = int(self.headers["Upload-Offset"])
-                remaining = int(self.headers["Content-Length"])
-            except (KeyError, ValueError):
-                return self.reply(400, body=b"Upload-Offset and Content-Length are required")
-            if offset != up["offset"]:
-                return self.reply(409, {"Tus-Resumable": "1.0.0"}, b"Upload-Offset does not match")
-            if offset + remaining > up["length"]:
-                return self.reply(400, body=b"Chunk exceeds Upload-Length")
-            # Bytes are committed as they arrive, so an interrupted request keeps its progress.
-            with open(up["path"], "ab") as f:
-                while remaining > 0:
-                    data = self.rfile.read(min(CHUNK, remaining))
-                    if not data:
-                        self.close_connection = True
-                        return
-                    f.write(data)
-                    f.flush()
-                    remaining -= len(data)
-                    with lock:
-                        up["offset"] += len(data)
-            return self.reply(204, {"Tus-Resumable": "1.0.0", "Upload-Offset": str(up["offset"])})
+            return self.mock_patch(parent, upload_id, up)
         return self.reply(405)
+
+    def mock_create(self, base):
+        defer = self.headers.get("Upload-Defer-Length") == "1"
+        length = None
+        if not defer:
+            try:
+                length = int(self.headers["Upload-Length"])
+                if length < 0:
+                    raise ValueError
+            except (KeyError, ValueError):
+                return self.reply(400, body=b"Upload-Length (or Upload-Defer-Length: 1) is required")
+            if length > args.max_size:
+                return self.reply(413, self.mock_headers(), b"Upload-Length exceeds the maximum size")
+        uid = str(uuid.uuid4())
+        path = os.path.join(tmpdir, uid)
+        open(path, "wb").close()
+        expires = time.time() + args.expire_seconds
+        with lock:
+            uploads[uid] = {"length": length, "offset": 0, "path": path, "done": False, "expires": expires,
+                            "meta": self.headers.get("Upload-Metadata", ""),
+                            "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        self.reply(201, self.mock_headers({"Location": "%s/%s" % (base, uid),
+                                           "Upload-Expires": formatdate(expires, usegmt=True)}))
+
+    def mock_patch(self, parent, uid, up):
+        if self.headers.get("Content-Type") != "application/offset+octet-stream":
+            return self.reply(415, self.mock_headers())
+        try:
+            offset = int(self.headers["Upload-Offset"])
+            remaining = int(self.headers.get("Content-Length") or 0)
+        except (KeyError, ValueError):
+            return self.reply(400, body=b"Upload-Offset is required")
+        if up["done"]:
+            return self.reply(403, self.mock_headers(), b"The upload is already complete")
+        if offset != up["offset"]:
+            return self.reply(409, self.mock_headers(), b"Upload-Offset does not match")
+        if self.headers.get("Upload-Length") is not None:      # fixes the length of a deferred upload
+            try:
+                new_length = int(self.headers["Upload-Length"])
+            except ValueError:
+                return self.reply(400, body=b"Upload-Length must be a number")
+            if up["length"] is not None and up["length"] != new_length:
+                return self.reply(400, body=b"Upload-Length cannot be changed")
+            if new_length < offset + remaining:
+                return self.reply(400, body=b"Upload-Length is smaller than the data")
+            up["length"] = new_length
+        if up["length"] is not None and offset + remaining > up["length"]:
+            return self.reply(400, body=b"Chunk exceeds Upload-Length")
+        checksum = self.headers.get("Upload-Checksum")
+        try:
+            if checksum:
+                algo, _, given = checksum.partition(" ")
+                if algo not in CHECKSUMS:
+                    return self.reply(400, body=b"Unsupported checksum algorithm")
+                data = b"".join(self.body_chunks(remaining))
+                actual = base64.b64encode(CHECKSUMS[algo](data).digest()).decode()
+                if actual != given.strip():
+                    return self.reply(460, self.mock_headers(), b"Checksum mismatch")
+                with open(up["path"], "ab") as f:
+                    f.write(data)
+                with lock:
+                    up["offset"] += len(data)
+            else:
+                # Bytes are committed as they arrive, so an interrupted request keeps its progress.
+                with open(up["path"], "ab") as f:
+                    for data in self.body_chunks(remaining):
+                        f.write(data)
+                        f.flush()
+                        with lock:
+                            up["offset"] += len(data)
+        except ConnectionError:
+            self.close_connection = True
+            return
+        headers = {"Upload-Offset": str(up["offset"])}
+        if up["length"] is not None and up["offset"] == up["length"]:
+            up["done"] = True
+            headers["Content-Location"] = "%s/%s" % (parent, uid)
+        self.reply(204, self.mock_headers(headers))
+
+    def mock_file(self, uid, content):
+        """The finished file: its record (JSON) or, under /content, its bytes."""
+        up = self.mock_lookup(uid)
+        if up is None or not up["done"]:
+            return self.reply(404, body=b"no such file")
+        meta = parse_metadata(up["meta"])
+        if content:
+            ctype = meta.get("filetype") or meta.get("type") or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(up["length"]))
+            self.end_headers()
+            if self.command == "GET":
+                with open(up["path"], "rb") as f:
+                    while True:
+                        data = f.read(CHUNK)
+                        if not data:
+                            break
+                        self.wfile.write(data)
+            return
+        self.reply_json(200, {"id": uid, "name": meta.get("filename") or meta.get("name") or uid,
+                              "size": up["length"], "contentType": meta.get("filetype") or meta.get("type") or "application/octet-stream",
+                              "createdBy": "mock", "creationTimeStamp": up["created"], "fileStatus": "available"})
 
     # ---- reverse proxy ---------------------------------------------------
     def proxy(self):
@@ -162,16 +320,9 @@ class Handler(BaseHTTPRequestHandler):
         body = None
         if length:
             headers["Content-Length"] = str(length)
-
-            def stream():
-                left = length
-                while left > 0:
-                    data = self.rfile.read(min(CHUNK, left))
-                    if not data:
-                        raise ConnectionError("client disconnected mid-request")
-                    left -= len(data)
-                    yield data
-            body = stream()
+            body = self.body_chunks(length)
+        elif self.command in ("POST", "PUT", "PATCH"):
+            headers["Content-Length"] = "0"
         try:
             conn.request(self.command, self.path, body=body, headers=headers)
             resp = conn.getresponse()
@@ -213,10 +364,23 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(resp.status, out, data)
 
 
-def main():
+def make_server(port=8000, mock=True, target=None, headers=(), cafile=None, max_size=50 * 1024 ** 3,
+                expire_seconds=3600):
+    """Build the server (used by main() and by the tests)."""
     global args, ssl_ctx, tmpdir
+    args = argparse.Namespace(mock=mock, target=target, header=list(headers), cafile=cafile, port=port,
+                              max_size=max_size, expire_seconds=expire_seconds)
+    if target:
+        ssl_ctx = ssl.create_default_context(cafile=cafile)
+    else:
+        tmpdir = tempfile.mkdtemp(prefix="tus-mock-")
+        uploads.clear()
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
+def main():
     sys.stdout.reconfigure(line_buffering=True)   # show log lines immediately, even when piped
-    ap =argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--target", help="origin of the real service, e.g. https://dev-host:8443")
     mode.add_argument("--mock", action="store_true", help="run a built-in tus server instead")
@@ -225,16 +389,15 @@ def main():
                     help='extra header to send upstream, e.g. "Authorization: Bearer ..." (repeatable)')
     ap.add_argument("--cafile", help="CA bundle to trust for an https --target (internal CA)")
     ap.add_argument("--max-size", type=int, default=50 * 1024 ** 3, help="mock Tus-Max-Size in bytes")
-    args = ap.parse_args()
-    if args.target:
-        t = urlsplit(args.target)
+    ap.add_argument("--expire-seconds", type=int, default=3600,
+                    help="mock: unfinished uploads expire after this many seconds")
+    a = ap.parse_args()
+    if a.target:
+        t = urlsplit(a.target)
         if t.scheme not in ("http", "https") or not t.netloc:
             ap.error("--target must look like https://host[:port]")
-        ssl_ctx = ssl.create_default_context(cafile=args.cafile)
-    else:
-        tmpdir = tempfile.mkdtemp(prefix="tus-mock-")
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print("Upload page: http://localhost:%d/  (%s)" % (args.port, "mock tus server" if args.mock else "proxy to " + args.target))
+    srv = make_server(a.port, a.mock, a.target, a.header, a.cafile, a.max_size, a.expire_seconds)
+    print("Upload page: http://localhost:%d/  (%s)" % (a.port, "mock tus server" if a.mock else "proxy to " + a.target))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
